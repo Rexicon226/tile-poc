@@ -36,7 +36,7 @@ const topology: Topology.Description = .{
 };
 
 pub fn main() !void {
-    try Topology.setup(std.heap.smp_allocator, topology, .{
+    try Topology.spawn(std.heap.smp_allocator, topology, .{
         .producer1 = producer1,
         .consumer1 = consumer1,
         .consumer2 = consumer2,
@@ -45,7 +45,7 @@ pub fn main() !void {
     std.debug.print("ending!\n", .{});
 }
 
-fn producer1(args: topology.Args(.producer1)) void {
+fn producer1(args: topology.Args(.producer1)) !void {
     std.debug.print("producer 1 started up!\n", .{});
     const ring = args.channel;
 
@@ -56,7 +56,7 @@ fn producer1(args: topology.Args(.producer1)) void {
     std.debug.print("producer 1 finished pushing\n", .{});
 }
 
-fn consumer1(args: topology.Args(.consumer1)) void {
+fn consumer1(args: topology.Args(.consumer1)) !void {
     std.debug.print("consumer 1 started up!\n", .{});
     const ring = args.channel;
 
@@ -67,7 +67,7 @@ fn consumer1(args: topology.Args(.consumer1)) void {
     std.debug.print("max consumer 1: '{d}'\n", .{max});
 }
 
-fn consumer2(args: topology.Args(.consumer2)) void {
+fn consumer2(args: topology.Args(.consumer2)) !void {
     std.debug.print("consumer 2 started up!\n", .{});
     const ring = args.channel;
 

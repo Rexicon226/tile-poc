@@ -2,6 +2,7 @@ const std = @import("std");
 const topo = @import("topology.zig");
 
 const Ids = enum {
+    idle,
     producer1,
     producer2,
     consumer1,
@@ -25,12 +26,16 @@ const Topology = topo.Topology(Ids, Types);
 
 const topology: Topology.Description = .{
     .tiles = .{
+        // Will just kinda set there and not do anything. For experimenting.
+        .idle = .{ .core = 0 },
+
         // This tile will just be running without any connections.
-        .producer1 = .{ .core = 0 },
+        // As an example, request 64mb of stack size (more than the default 8mb on Linux)
+        .producer1 = .{ .core = 1, .stack_size = 64 * 1024 * 1024 },
 
         // These tiles share a ring, where producer2 pushes and consumer1 pops.
-        .producer2 = .{ .core = 1 },
-        .consumer1 = .{ .core = 2 },
+        .producer2 = .{ .core = 2 },
+        .consumer1 = .{ .core = 3 },
     },
     .edges = &.{
         .{
@@ -48,7 +53,8 @@ const topology: Topology.Description = .{
 };
 
 pub fn main() !void {
-    try Topology.setup(std.heap.smp_allocator, topology, .{
+    try Topology.spawn(std.heap.smp_allocator, topology, .{
+        .idle = idle,
         .producer1 = producer1,
         .producer2 = producer2,
         .consumer1 = consumer1,
@@ -57,14 +63,22 @@ pub fn main() !void {
     std.debug.print("ending!\n", .{});
 }
 
-fn producer1(_: topology.Args(.producer1)) void {
-    std.debug.print("producer 1 started up!\n", .{});
-    // does something here... but has no arguments!
+fn idle() !void {
+    std.Thread.sleep(3 * std.time.ns_per_s);
 }
 
-fn producer2(args: topology.Args(.producer2)) void {
+fn producer1() !void {
+    const stack_size = try std.posix.getrlimit(.STACK);
+    std.debug.print("producer 1 started up! {d}\n", .{std.fmt.fmtIntSizeBin(stack_size.cur)});
+    // does something here... but has no arguments!
+    std.Thread.sleep(5 * std.time.ns_per_s);
+}
+
+fn producer2(args: topology.Args(.producer2)) !void {
+    const stack_size = try std.posix.getrlimit(.STACK);
+    std.debug.print("producer 2 started up! {d}\n", .{std.fmt.fmtIntSizeBin(stack_size.cur)});
+
     const ring = args.foo_channel;
-    std.debug.print("producer 2 started up!\n", .{});
     for (0..20) |i| {
         ring.push(.{ .x = @intCast(i) }) catch break;
         std.debug.print("pushed: {d}\n", .{i});
@@ -72,12 +86,14 @@ fn producer2(args: topology.Args(.producer2)) void {
     std.debug.print("producer 2 finished pushing\n", .{});
 }
 
-fn consumer1(args: topology.Args(.consumer1)) void {
-    const ring = args.foo_channel;
-    std.debug.print("consumer 1 started up!\n", .{});
+fn consumer1(args: topology.Args(.consumer1)) !void {
+    const stack_size = try std.posix.getrlimit(.STACK);
+    std.debug.print("consumer 1 started up! {d}\n", .{std.fmt.fmtIntSizeBin(stack_size.cur)});
     std.Thread.sleep(2 * std.time.ns_per_s);
+
+    const ring = args.foo_channel;
     while (ring.pop()) |element| {
-        std.debug.print("consumer 1 got: {}\n", .{element});
+        std.debug.print("consumer 1 got: {d}\n", .{element.x});
     }
     std.posix.abort(); // showcase what the watchdog does on abort
 }

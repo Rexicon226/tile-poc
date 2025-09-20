@@ -106,16 +106,18 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
 
             /// Returns the function type required for a tile to satisfy the topology provided
             fn Function(desc: Description, id: Id) type {
+                const A = Args(desc, id);
+                const has_parameters = @typeInfo(A).@"struct".fields.len != 0;
                 return @Type(.{ .@"fn" = .{
-                    .params = &.{.{
+                    .params = if (has_parameters) &.{.{
                         .type = Args(desc, id),
                         .is_generic = false,
                         .is_noalias = false,
-                    }},
+                    }} else &.{},
                     .calling_convention = .auto,
                     .is_generic = false,
                     .is_var_args = false,
-                    .return_type = void,
+                    .return_type = anyerror!void,
                 } });
             }
 
@@ -132,12 +134,10 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
                     const consuming = edge.to == id;
                     if (edge.mode == .shared and !consuming) {
                         // have we already seen and created a field for a shared producer?
-                        // if so, just skip creating this field, since they'll be shared.
-                        // if the `shared` mode isn't indicated, there will be a compile error
+                        // - if so, just skip creating this field, since they'll be shared.
+                        // - if the `shared` mode isn't indicated, there will be a compile error
                         // due to duplicate struct fields.
-                        for (desc.edges[0..i]) |previous| {
-                            if (previous.from == id) continue :edges;
-                        }
+                        for (desc.edges[0..i]) |previous| if (previous.from == id) continue :edges;
                     }
 
                     const Producer = switch (edge.mode) {
@@ -172,12 +172,16 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
             id: Id,
             info: Info,
 
-            /// TODO: think about what other info we could describe about a tile.
-            ///
-            /// Some ideas:
-            /// - the stack size of the forked process?
             const Info = struct {
+                /// Which core number the tile will be pinned to. Indexed from 0.
                 core: u16,
+                /// If set, `setrlimit` will be called until the stack size require is fullfilled
+                /// for that fork. Useful when we have individual tiles that require more stack
+                /// than simpler ones.
+                ///
+                /// NOTE: a bit of experimenting shows that `setrlimit` is in-fact per-process, so
+                /// each fork can have a different amount.
+                stack_size: ?u64 = null,
             };
         };
 
@@ -337,14 +341,16 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
             };
         };
 
+        const Map = std.HashMapUnmanaged(
+            MapKey,
+            *TypeErasedRingBuffer,
+            MapKey.Context,
+            std.hash_map.default_max_load_percentage,
+        );
+
         /// Spawns the tiles and coordinates creating the rings.
-        pub fn setup(allocator: std.mem.Allocator, comptime desc: Description, funcs: desc.Functions()) !void {
-            var map: std.HashMapUnmanaged(
-                MapKey,
-                *TypeErasedRingBuffer,
-                MapKey.Context,
-                std.hash_map.default_max_load_percentage,
-            ) = .{};
+        pub fn spawn(allocator: std.mem.Allocator, comptime desc: Description, funcs: desc.Functions()) !void {
+            var map: Map = .{};
             defer map.deinit(allocator);
 
             inline for (desc.edges, 0..) |edge, i| {
@@ -394,30 +400,20 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
                 const pid = try std.posix.fork();
                 if (pid < 0) @panic("fork failed?");
                 if (pid == 0) {
-                    // child, pin the tile to the specified core in the topology
-                    var set: std.os.linux.cpu_set_t = @splat(0);
-                    const size_in_bits = 8 * @sizeOf(usize);
-                    set[tile.core / size_in_bits] |= @as(usize, 1) << @intCast(tile.core % size_in_bits);
-                    try std.os.linux.sched_setaffinity(0, &set);
+                    // child
+                    // we *cannot* return errors from within the fork,
+                    // since it could lead to unexpected outside this function
+                    errdefer comptime unreachable;
 
-                    // TODO: there are a few nested loops here, not sure how to optimize yet, but doesn't really matter for perf.
-                    var args: desc.Args(id) = undefined;
-                    inline for (@typeInfo(desc.Args(id)).@"struct".fields) |field| {
-                        // find the `from` which will key into the map with the arg field name to find
-                        // the ring we need to use
-                        const from_id = inline for (desc.edges) |edge| {
-                            if ((edge.to == id or edge.from == id) and
-                                std.mem.eql(u8, edge.name, field.name)) break edge.from;
-                        } else unreachable;
-
-                        @field(args, field.name) = @alignCast(@fieldParentPtr("erased", map.get(.{
-                            .id = from_id,
-                            .name = field.name,
-                        }).?));
-                    }
-
-                    const func = @field(funcs, tile_field.name);
-                    @call(.auto, func, .{args});
+                    runTile(tile, id, desc, funcs, tile_field.name, &map) catch |err| {
+                        std.debug.print(
+                            "'{s}' failed with error: {s}\n",
+                            .{ @tagName(id), @errorName(err) },
+                        );
+                        if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace.*);
+                        std.debug.print("'{s}': aborting", .{@tagName(id)});
+                        std.posix.abort();
+                    };
 
                     std.debug.print("'{s}' exiting\n", .{@tagName(id)});
                     std.posix.exit(0); // tile done
@@ -447,6 +443,62 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
                 else if (W.IFSTOPPED(status))
                     log.warn("Child {d} stopped by signal {d}", .{ pid, W.STOPSIG(status) });
             }
+        }
+
+        fn runTile(
+            tile: Tile.Info,
+            comptime id: Id,
+            comptime desc: Description,
+            funcs: desc.Functions(),
+            comptime tile_name: []const u8,
+            map: *const Map,
+        ) !void {
+            // setup the info requested of this tile.
+            {
+                // pin the tile to the specified core in the topology
+                var set: std.os.linux.cpu_set_t = @splat(0);
+                const size_in_bits = 8 * @sizeOf(usize);
+                set[tile.core / size_in_bits] |= @as(usize, 1) << @intCast(tile.core % size_in_bits);
+                try std.os.linux.sched_setaffinity(0, &set);
+
+                // configure the stack size
+                if (tile.stack_size) |stack_size| {
+                    var rl = try std.posix.getrlimit(.STACK);
+                    if (rl.cur < stack_size) {
+                        rl.cur = stack_size;
+                        try std.posix.setrlimit(.STACK, rl);
+                    }
+                }
+
+                // set the name of the process to the id, doesn't require a pid
+                switch (@as(std.posix.E, @enumFromInt(try std.posix.prctl(
+                    .SET_NAME,
+                    .{@intFromPtr(@tagName(id).ptr)},
+                )))) {
+                    .SUCCESS => {},
+                    else => |e| return std.posix.unexpectedErrno(e),
+                }
+            }
+
+            // TODO: there are a few nested loops here, not sure how to optimize yet, but doesn't really matter for perf.
+            const Args = desc.Args(id);
+            var args: Args = undefined;
+            inline for (@typeInfo(Args).@"struct".fields) |field| {
+                // find the `from` which will key into the map with the arg field name to find the ring we need to use
+                const from_id = inline for (desc.edges) |edge| {
+                    if ((edge.to == id or edge.from == id) and
+                        std.mem.eql(u8, edge.name, field.name)) break edge.from;
+                } else unreachable;
+
+                @field(args, field.name) = @alignCast(@fieldParentPtr("erased", map.get(.{
+                    .id = from_id,
+                    .name = field.name,
+                }).?));
+            }
+
+            const func = @field(funcs, tile_name);
+            const arguments = if (@typeInfo(Args).@"struct".fields.len == 0) .{} else .{args};
+            try @call(.auto, func, arguments);
         }
     };
 }
