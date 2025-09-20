@@ -116,11 +116,12 @@ fn Topology(comptime desc: Description) type {
                 try map.append(allocator, type_erased);
             }
 
+            var pid_map: std.AutoHashMapUnmanaged(std.posix.pid_t, Tile) = .{};
+            defer pid_map.deinit(allocator);
+
             for (desc.tiles) |tile| {
                 const pid = try std.posix.fork();
-                if (pid < 0) {
-                    @panic("fork failed?");
-                }
+                if (pid < 0) @panic("fork failed?");
                 if (pid == 0) {
                     // child
 
@@ -129,9 +130,6 @@ fn Topology(comptime desc: Description) type {
                     const size_in_bits = 8 * @sizeOf(usize);
                     set[tile.core / size_in_bits] |= @as(usize, 1) << @intCast(tile.core % size_in_bits);
                     try std.os.linux.sched_setaffinity(0, &set);
-
-                    // TODO: we should be installing segfault handlers here that notify
-                    // the watchdog (root process) that a process crashed, and possibly restart it?
 
                     switch (tile.id) {
                         inline else => |id| {
@@ -155,10 +153,29 @@ fn Topology(comptime desc: Description) type {
 
                     std.debug.print("'{s}' exiting\n", .{@tagName(tile.id)});
                     std.posix.exit(0); // tile done
+                } else {
+                    // parent, record the pid
+                    try pid_map.put(allocator, pid, tile);
                 }
             }
 
-            std.Thread.sleep(std.math.maxInt(u64));
+            // we begin the role of watchdog now, listening for any failures with the tiles
+            const log = std.log.scoped(.watchdog);
+            while (pid_map.count() != 0) { // while there exist alive pids
+                const result = std.posix.waitpid(-1, 0);
+                defer std.debug.assert(pid_map.remove(result.pid));
+                const pid = result.pid;
+                const status = result.status;
+                if (result.pid == -1) @panic("something went wrong");
+
+                const W = std.c.W;
+                if (W.IFEXITED(status))
+                    log.warn("Child {d} exited with status: {d}", .{ pid, W.EXITSTATUS(status) })
+                else if (W.IFSIGNALED(status))
+                    log.warn("Child {d} killed by signal {d}", .{ pid, W.TERMSIG(status) })
+                else if (W.IFSTOPPED(status))
+                    log.warn("Child {d} stopped by signal {d}", .{ pid, W.STOPSIG(status) });
+            }
         }
     };
 }
@@ -190,7 +207,7 @@ pub fn main() !void {
 
     try Top.setup(std.heap.smp_allocator);
 
-    std.debug.print("hello\n", .{});
+    std.debug.print("ending!\n", .{});
 }
 
 fn producer1() void {
@@ -213,4 +230,6 @@ fn consumer1(ring: *ring_buffers.Consumer(.foo)) void {
     while (ring.pop()) |element| {
         std.debug.print("consumer 1 got: {}\n", .{element});
     }
+
+    std.posix.abort();
 }
