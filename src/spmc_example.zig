@@ -30,8 +30,30 @@ const topology: Topology.Description = .{
         .consumer2 = .{ .core = 2 },
     },
     .edges = &.{
-        .{ .name = "channel", .from = .producer1, .to = .consumer1, .mode = .shared, .type = .foo, .capacity = 1024 },
-        .{ .name = "channel", .from = .producer1, .to = .consumer2, .mode = .shared, .type = .foo, .capacity = 1024 },
+        .{
+            .name = "channel",
+            .from = .producer1,
+            .to = .consumer1,
+            .mode = .shared,
+            .type = .foo,
+            .capacity = 1024,
+        },
+        .{
+            .name = "channel",
+            .from = .producer1,
+            .to = .consumer2,
+            .mode = .shared,
+            .type = .foo,
+            .capacity = 1024,
+        },
+        .{
+            .name = "bar",
+            .from = .producer1,
+            .to = .consumer1,
+            .mode = .readonly,
+            .type = .foo,
+            .capacity = 1024,
+        },
     },
 };
 

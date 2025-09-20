@@ -166,6 +166,39 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
                     .layout = .auto,
                 } });
             }
+
+            fn validate(desc: Description) void {
+                // ensure all consumers of shared edges use `shared` mode
+                {
+                    // first we find all producer_id + name pairs in the edges, and note down
+                    // if we see any more than once (those are the ones that need to be shared!)
+                    var seen: []const MapKey = &.{};
+                    var should_be_shared: []const MapKey = &.{};
+                    edges: for (desc.edges) |edge| {
+                        const key: MapKey = .fromEdge(edge);
+                        for (seen) |p| {
+                            if (MapKey.Context.eql(.{}, p, key)) {
+                                // we've already seen this edge
+                                should_be_shared = should_be_shared ++ &[_]MapKey{key};
+                                continue :edges;
+                            }
+                        } else {
+                            seen = seen ++ &[_]MapKey{key};
+                        }
+                    }
+
+                    // go through the list again and ensure that all of the edges on the `should_be_shared`, are infact shared
+                    for (desc.edges) |edge| {
+                        const key: MapKey = .fromEdge(edge);
+                        for (should_be_shared) |p| {
+                            if (MapKey.Context.eql(.{}, p, key) and edge.mode != .shared) {
+                                @compileError("edge '" ++ edge.name ++ "' from producer '" ++ @tagName(edge.from) ++
+                                    "' is used by more than two tiles, but not indicated as `shared`");
+                            }
+                        }
+                    }
+                }
+            }
         };
 
         const Tile = struct {
@@ -308,6 +341,7 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
                                 .acquire,
                             )) |new| {
                                 head = new;
+                                continue;
                             } else {
                                 // TODO: fence here before, but i'm not sure what it was doing, investigate
                                 // TODO: what happens if we push a ton of things before installation and
@@ -326,6 +360,13 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
         const MapKey = struct {
             id: Id,
             name: []const u8,
+
+            fn fromEdge(edge: Description.Edge) MapKey {
+                return .{
+                    .id = edge.from,
+                    .name = edge.name,
+                };
+            }
 
             pub const Context = struct {
                 pub fn hash(_: Context, a: MapKey) u64 {
@@ -349,15 +390,18 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
         );
 
         /// Spawns the tiles and coordinates creating the rings.
-        pub fn spawn(allocator: std.mem.Allocator, comptime desc: Description, funcs: desc.Functions()) !void {
+        pub fn spawn(
+            allocator: std.mem.Allocator,
+            comptime desc: Description,
+            funcs: desc.Functions(),
+        ) !void {
+            comptime desc.validate();
+
             var map: Map = .{};
             defer map.deinit(allocator);
 
             inline for (desc.edges, 0..) |edge, i| {
-                const gop = try map.getOrPut(allocator, .{
-                    .id = edge.from,
-                    .name = edge.name,
-                });
+                const gop = try map.getOrPut(allocator, .fromEdge(edge));
 
                 if (gop.found_existing) {
                     // if two edges share the same "from" and "name",
@@ -402,7 +446,7 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
                 if (pid == 0) {
                     // child
                     // we *cannot* return errors from within the fork,
-                    // since it could lead to unexpected outside this function
+                    // since it could lead to unexpected execution outside this function
                     errdefer comptime unreachable;
 
                     runTile(tile, id, desc, funcs, tile_field.name, &map) catch |err| {
@@ -428,12 +472,12 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
 
             // we begin the role of watchdog now, listening for any failures with the tiles
             const log = std.log.scoped(.watchdog);
-            while (pid_map.count() != 0) { // while there exist alive pids
+            while (true) { // keep running until a child dies
                 const result = std.posix.waitpid(-1, 0);
                 defer std.debug.assert(pid_map.remove(result.pid));
                 const pid = result.pid;
                 const status = result.status;
-                if (result.pid == -1) @panic("something went wrong");
+                if (pid == -1) @panic("something went wrong");
 
                 const W = std.c.W;
                 if (W.IFEXITED(status))

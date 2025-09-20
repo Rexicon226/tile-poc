@@ -5,6 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     inline for (.{
+        "main",
         "spsc_example",
         "spmc_example",
     }) |name| {
@@ -20,13 +21,14 @@ pub fn build(b: *std.Build) void {
             .root_module = exe_mod,
         });
 
-        b.installArtifact(exe);
+        const build_step = b.step(name, "Builds the example");
+        build_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
 
         const run_cmd = b.addRunArtifact(exe);
         run_cmd.step.dependOn(b.getInstallStep());
 
         if (b.args) |args| run_cmd.addArgs(args);
-        const run_step = b.step("run-" ++ name, "Run the app");
+        const run_step = b.step("run-" ++ name, "Run the example");
         run_step.dependOn(&run_cmd.step);
     }
 }
