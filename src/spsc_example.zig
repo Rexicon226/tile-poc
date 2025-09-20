@@ -34,6 +34,7 @@ const topology: Topology.Description = .{
     },
     .edges = &.{
         .{
+            .name = "foo_channel",
             // describes the relationship in the previous sentence ^
             .from = .producer2,
             .to = .consumer1,
@@ -56,12 +57,13 @@ pub fn main() !void {
     std.debug.print("ending!\n", .{});
 }
 
-fn producer1() void {
+fn producer1(_: topology.Args(.producer1)) void {
     std.debug.print("producer 1 started up!\n", .{});
     // does something here... but has no arguments!
 }
 
-fn producer2(ring: *Topology.spsc.Producer(.foo, 1024)) void {
+fn producer2(args: topology.Args(.producer2)) void {
+    const ring = args.foo_channel;
     std.debug.print("producer 2 started up!\n", .{});
     for (0..20) |i| {
         ring.push(.{ .x = @intCast(i) }) catch break;
@@ -70,13 +72,12 @@ fn producer2(ring: *Topology.spsc.Producer(.foo, 1024)) void {
     std.debug.print("producer 2 finished pushing\n", .{});
 }
 
-fn consumer1(ring: *Topology.spsc.Consumer(.foo, 1024)) void {
+fn consumer1(args: topology.Args(.consumer1)) void {
+    const ring = args.foo_channel;
     std.debug.print("consumer 1 started up!\n", .{});
     std.Thread.sleep(2 * std.time.ns_per_s);
-
     while (ring.pop()) |element| {
         std.debug.print("consumer 1 got: {}\n", .{element});
     }
-
-    std.posix.abort();
+    std.posix.abort(); // showcase what the watchdog does on abort
 }

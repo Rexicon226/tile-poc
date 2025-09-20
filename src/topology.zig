@@ -12,6 +12,23 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
 
             /// Describes a communication channel between two tiles.
             const Edge = struct {
+                /// What the edge will be called in the `from` and `to` tile function arguments.
+                /// We only have one name shared across the two tiles in order to make it clearer
+                /// which channel does what. There is no possiblity of confusing, since the naming
+                /// is shared across implementations.
+                ///
+                /// A couple rules:
+                ///
+                /// - A tile A cannot have two edges (no matter if it is `from` or `to`) which have
+                /// the same name. e.g. if a tile A and B share an edge called "foo", tile B cannot
+                /// have an edge with tile C called "foo".
+                ///
+                /// - If a tile A and B share an edge "foo", and a tile C and D share an edge "foo",
+                /// that is completely legal. The only thing that matters is that in between each tile,
+                /// the edges it is a part of do not collide in names.
+                ///
+                /// Both of these properties are asserted at compile-time.
+                name: []const u8,
                 /// Which tile will be sending the data.
                 from: Id,
                 /// Which tile will be recving the data.
@@ -19,8 +36,19 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
                 /// The mode describes the channel relationship between the two tiles.
                 ///
                 /// - `readonly`, The `to` tile in this edge cannot push back onto the channel.
+                /// - `shared`, The `from` tile in this edge will have multiple consumer tiles,
+                /// and it will switch to using an spmc queue instead of a spsc one. Both the
+                /// `from` and `to` tiles need to indicate `shared` mode in their respective edges.
+                /// Which edge is shared is determined by the name, they must match in all edges.
                 ///
                 /// TODO: consider adding a `writable` mode in case that is necassary. I *hope*, it isn't.
+                ///
+                /// TODO: check that for `shared` edges, the `from` node really does have multiple consumers.
+                /// or maybe not, if we want it to be a bit more generic.
+                ///
+                /// TODO: currently there is no error when we create a `readonly` edge between tile A and B
+                /// and then a `shared` edge between tile A and C. there should be! if more than two tiles
+                /// are using a ring, it should be shared from all sides.
                 mode: Mode,
                 /// The type of the data moved across the channel. We express this is a finite list of
                 /// possibilities, since we want to encourage as little different `Types` as possible,
@@ -43,6 +71,10 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
 
                 const Mode = enum {
                     readonly,
+                    // TODO: consider moving shared/unique into a seperate config, although i
+                    // do like the fact that shared implies readonly on recv, since we *really* want to
+                    // avoid mpmc rings, they should just not be needed at any point in time.
+                    shared,
                 };
             };
 
@@ -56,7 +88,7 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
 
                     fields = fields ++ [_]std.builtin.Type.StructField{.{
                         .name = tile_field.name,
-                        .type = Tile.Function(desc, @field(Id, tile_field.name)),
+                        .type = Function(desc, @field(Id, tile_field.name)),
                         .default_value_ptr = null,
                         .is_comptime = false,
                         .alignment = 0,
@@ -69,6 +101,69 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
                     .fields = fields,
                     .backing_integer = null,
                     .is_tuple = false,
+                } });
+            }
+
+            /// Returns the function type required for a tile to satisfy the topology provided
+            fn Function(desc: Description, id: Id) type {
+                return @Type(.{ .@"fn" = .{
+                    .params = &.{.{
+                        .type = Args(desc, id),
+                        .is_generic = false,
+                        .is_noalias = false,
+                    }},
+                    .calling_convention = .auto,
+                    .is_generic = false,
+                    .is_var_args = false,
+                    .return_type = void,
+                } });
+            }
+
+            /// Creates the `args` parameter for tile functions based off of what edges they need to work with.
+            pub fn Args(desc: Description, id: Id) type {
+                const StructField = std.builtin.Type.StructField;
+                var fields: []const StructField = &.{};
+                edges: for (desc.edges, 0..) |edge, i| {
+                    std.debug.assert(edge.to != edge.from); // uhh, don't do this?
+                    std.debug.assert(@field(desc.tiles, @tagName(edge.from)) != null); // edge from disabled tile
+                    std.debug.assert(@field(desc.tiles, @tagName(edge.to)) != null); // edge to disabled tile
+                    if (edge.to != id and edge.from != id) continue; // nothing to do
+
+                    const consuming = edge.to == id;
+                    if (edge.mode == .shared and !consuming) {
+                        // have we already seen and created a field for a shared producer?
+                        // if so, just skip creating this field, since they'll be shared.
+                        // if the `shared` mode isn't indicated, there will be a compile error
+                        // due to duplicate struct fields.
+                        for (desc.edges[0..i]) |previous| {
+                            if (previous.from == id) continue :edges;
+                        }
+                    }
+
+                    const Producer = switch (edge.mode) {
+                        .readonly => spsc.Producer(edge.type, edge.capacity),
+                        .shared => spmc.Producer(edge.type, edge.capacity),
+                    };
+                    const Consumer = switch (edge.mode) {
+                        .readonly => spsc.Consumer(edge.type, edge.capacity),
+                        .shared => spmc.Consumer(edge.type, edge.capacity),
+                    };
+
+                    fields = fields ++ [_]StructField{.{
+                        .name = edge.name ++ "",
+                        .type = if (consuming) *Consumer else *Producer,
+                        .default_value_ptr = null,
+                        .is_comptime = false,
+                        .alignment = @alignOf(*Producer),
+                    }};
+                }
+
+                return @Type(.{ .@"struct" = .{
+                    .fields = fields,
+                    .decls = &.{},
+                    .backing_integer = null,
+                    .is_tuple = false,
+                    .layout = .auto,
                 } });
             }
         };
@@ -84,36 +179,6 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
             const Info = struct {
                 core: u16,
             };
-
-            pub fn Function(desc: Description, id: Id) type {
-                // record all rings which are directed at this tile and add them as parameters
-                const Param = std.builtin.Type.Fn.Param;
-                var params: []const Param = &.{};
-                for (desc.edges) |edge| {
-                    std.debug.assert(edge.to != edge.from); // uhh, don't do this?
-                    std.debug.assert(@field(desc.tiles, @tagName(edge.from)) != null); // edge from disabled tile
-                    std.debug.assert(@field(desc.tiles, @tagName(edge.to)) != null); // edge to disabled tile
-                    if (edge.to != id and edge.from != id) continue; // nothing to do
-
-                    const consuming = edge.to == id;
-                    params = params ++ [_]Param{.{
-                        .is_generic = false,
-                        .is_noalias = false,
-                        .type = if (consuming) switch (edge.mode) {
-                            .readonly => *spsc.Consumer(edge.type, edge.capacity),
-                            // TODO: we'll have writable here as well for a consumer/producer queue
-                        } else *spsc.Producer(edge.type, edge.capacity),
-                    }};
-                }
-
-                return @Type(.{ .@"fn" = .{
-                    .params = params,
-                    .calling_convention = .auto,
-                    .is_generic = false,
-                    .is_var_args = false,
-                    .return_type = void,
-                } });
-            }
         };
 
         pub const TypeErasedRingBuffer = struct {
@@ -169,11 +234,6 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
 
                     const mask = capacity - 1;
 
-                    fn getElements(rb: *Self) [*]align(1) T {
-                        const bytes: [*]u8 = @ptrCast(rb);
-                        return @ptrCast(bytes + @sizeOf(Self));
-                    }
-
                     pub fn pop(rb: *Self) ?T {
                         std.debug.assert(t == rb.erased.type);
 
@@ -188,41 +248,140 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
             }
         };
 
+        pub const spmc = struct {
+            pub fn Producer(comptime t: Types, comptime capacity: comptime_int) type {
+                return struct {
+                    elements: [capacity]T,
+                    erased: TypeErasedRingBuffer,
+
+                    const Self = @This();
+                    const T = t.Data();
+
+                    pub fn init(rb: *Self) void {
+                        rb.* = .{
+                            .erased = .{
+                                .head = .init(std.math.maxInt(u64)),
+                                .tail = .init(std.math.maxInt(u64)),
+                                .type = t,
+                            },
+                            .elements = undefined,
+                        };
+                    }
+
+                    pub fn push(rb: *Self, element: T) !void {
+                        const head = rb.erased.head.load(.acquire);
+                        const tail = rb.erased.tail.load(.acquire);
+                        if (tail -% head == capacity) return error.RingFull;
+
+                        const idx = tail % capacity;
+                        rb.elements[idx] = element;
+
+                        rb.erased.tail.store(tail +% 1, .release);
+                    }
+                };
+            }
+
+            pub fn Consumer(comptime t: Types, comptime capacity: comptime_int) type {
+                return struct {
+                    elements: [capacity]T,
+                    erased: TypeErasedRingBuffer,
+
+                    const Self = @This();
+                    const T = t.Data();
+
+                    pub fn pop(rb: *Self) ?T {
+                        var head = rb.erased.head.load(.acquire);
+
+                        while (true) {
+                            const tail = rb.erased.tail.load(.acquire);
+                            if (tail == head) return null;
+
+                            // try to install new head index
+                            if (rb.erased.head.cmpxchgWeak(
+                                head,
+                                head +% 1,
+                                .acq_rel,
+                                .acquire,
+                            )) |new| {
+                                head = new;
+                            } else {
+                                // TODO: fence here before, but i'm not sure what it was doing, investigate
+                                // TODO: what happens if we push a ton of things before installation and
+                                // the read, how to ensure this read stays valid. i.e pop thread suspended.
+
+                                // won the race, it's now safe to read the element,
+                                // nothing else should try to touch it
+                                return rb.elements[head % capacity];
+                            }
+                        }
+                    }
+                };
+            }
+        };
+
+        const MapKey = struct {
+            id: Id,
+            name: []const u8,
+
+            pub const Context = struct {
+                pub fn hash(_: Context, a: MapKey) u64 {
+                    var hasher = std.hash.Wyhash.init(0);
+                    std.hash.autoHash(&hasher, a.id);
+                    hasher.update(a.name);
+                    return hasher.final();
+                }
+
+                pub fn eql(_: Context, a: MapKey, b: MapKey) bool {
+                    return a.id == b.id and std.mem.eql(u8, a.name, b.name);
+                }
+            };
+        };
+
         /// Spawns the tiles and coordinates creating the rings.
         pub fn setup(allocator: std.mem.Allocator, comptime desc: Description, funcs: desc.Functions()) !void {
-            // TODO: this setup doesn't support having unique and then shared multi-consumer queues.
-            var map: std.ArrayListUnmanaged(*TypeErasedRingBuffer) = try .initCapacity(allocator, desc.edges.len);
+            var map: std.HashMapUnmanaged(
+                MapKey,
+                *TypeErasedRingBuffer,
+                MapKey.Context,
+                std.hash_map.default_max_load_percentage,
+            ) = .{};
             defer map.deinit(allocator);
 
-            // TODO: assuming that all maps are SPSC/readonly for now. we will need
-            // better selection logic on whether this should share from existing maps,
-            // i.e two readonly sinks + one writable source, or if each one should be seperate.
             inline for (desc.edges, 0..) |edge, i| {
-                const Ring = spsc.Producer(edge.type, edge.capacity);
-                const total_size = @sizeOf(Ring);
+                const gop = try map.getOrPut(allocator, .{
+                    .id = edge.from,
+                    .name = edge.name,
+                });
 
-                var path_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
-                const path = try std.fmt.bufPrintZ(&path_buffer, "/tile_ring_{d}", .{i});
+                if (gop.found_existing) {
+                    // if two edges share the same "from" and "name",
+                    // it must be a ring shared between multiple consumers
+                    std.debug.assert(edge.mode == .shared);
+                } else {
+                    const Ring = spsc.Producer(edge.type, edge.capacity);
+                    const total_size = @sizeOf(Ring);
 
-                // create the shared memory
-                const fd = std.c.shm_open(path, @bitCast(std.c.O{
-                    .CREAT = true,
-                    .ACCMODE = .RDWR,
-                }), 0o600);
-                if (fd < 0) @panic("failed to shm_open");
-                if (std.c.ftruncate(fd, total_size) != 0) @panic("failed to ftruncate");
-                const mapped = try std.posix.mmap(
-                    null,
-                    total_size,
-                    std.posix.PROT.READ | std.posix.PROT.WRITE,
-                    .{ .TYPE = .SHARED },
-                    fd,
-                    0,
-                );
+                    var path_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
+                    const path = try std.fmt.bufPrintZ(&path_buffer, "/tile_ring_{d}", .{i});
+                    const fd = std.c.shm_open(path, @bitCast(std.c.O{
+                        .CREAT = true,
+                        .ACCMODE = .RDWR,
+                    }), 0o600);
+                    if (fd < 0) @panic("failed to shm_open");
+                    if (std.c.ftruncate(fd, total_size) != 0) @panic("failed to ftruncate");
+                    const mapped = try std.posix.mmap(
+                        null,
+                        total_size,
+                        std.posix.PROT.READ | std.posix.PROT.WRITE,
+                        .{ .TYPE = .SHARED },
+                        fd,
+                        0,
+                    );
 
-                const p: *Ring = @ptrCast(mapped.ptr);
-                p.init();
-                try map.append(allocator, &p.erased);
+                    const p: *Ring = @ptrCast(mapped.ptr);
+                    p.init();
+                    gop.value_ptr.* = &p.erased;
+                }
             }
 
             var pid_map: std.AutoHashMapUnmanaged(std.posix.pid_t, Tile) = .{};
@@ -235,29 +394,30 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
                 const pid = try std.posix.fork();
                 if (pid < 0) @panic("fork failed?");
                 if (pid == 0) {
-                    // child
-
-                    // pin the tile to the specified core in the topology
+                    // child, pin the tile to the specified core in the topology
                     var set: std.os.linux.cpu_set_t = @splat(0);
                     const size_in_bits = 8 * @sizeOf(usize);
                     set[tile.core / size_in_bits] |= @as(usize, 1) << @intCast(tile.core % size_in_bits);
                     try std.os.linux.sched_setaffinity(0, &set);
 
-                    const Args = std.meta.ArgsTuple(Tile.Function(desc, id));
-                    var args: Args = undefined;
+                    // TODO: there are a few nested loops here, not sure how to optimize yet, but doesn't really matter for perf.
+                    var args: desc.Args(id) = undefined;
+                    inline for (@typeInfo(desc.Args(id)).@"struct".fields) |field| {
+                        // find the `from` which will key into the map with the arg field name to find
+                        // the ring we need to use
+                        const from_id = inline for (desc.edges) |edge| {
+                            if ((edge.to == id or edge.from == id) and
+                                std.mem.eql(u8, edge.name, field.name)) break edge.from;
+                        } else unreachable;
 
-                    // TODO: just assuming that the arguments will be in order of edge.to matches in the topology,
-                    // should figure out a better solution, just can't see one right now
-                    comptime var i: u32 = 0;
-                    inline for (desc.edges, 0..) |edge, j| {
-                        if (edge.to == id or edge.from == id) {
-                            args[i] = @alignCast(@fieldParentPtr("erased", map.items[j]));
-                            i += 1;
-                        }
+                        @field(args, field.name) = @alignCast(@fieldParentPtr("erased", map.get(.{
+                            .id = from_id,
+                            .name = field.name,
+                        }).?));
                     }
 
                     const func = @field(funcs, tile_field.name);
-                    if (args.len != 0) @call(.auto, func, args) else func();
+                    @call(.auto, func, .{args});
 
                     std.debug.print("'{s}' exiting\n", .{@tagName(id)});
                     std.posix.exit(0); // tile done
