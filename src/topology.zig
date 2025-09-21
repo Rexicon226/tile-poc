@@ -1,8 +1,12 @@
 const std = @import("std");
+const linux = std.os.linux;
 const Atomic = std.atomic.Value;
+const W = std.c.W;
 
 pub fn Topology(comptime Id: type, comptime Types: type) type {
     return struct {
+        const num_tiles = @typeInfo(Id).@"enum".fields.len;
+
         /// Describes the layout of the tile topology.
         pub const Description = struct {
             /// If a tile is null in the description, it is not spawned and any edges that are
@@ -80,7 +84,7 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
 
             /// Returns a struct where each field represents an active tile, and the field type
             /// is the tile function signature required to fulfill the edges.
-            fn Functions(comptime desc: Description) type {
+            pub fn Functions(comptime desc: Description) type {
                 var fields: []const std.builtin.Type.StructField = &.{};
                 for (@typeInfo(@TypeOf(desc.tiles)).@"struct".fields) |tile_field| {
                     // if this tile is disabled, just continue to the next one
@@ -394,98 +398,131 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
             allocator: std.mem.Allocator,
             comptime desc: Description,
             funcs: desc.Functions(),
+            pipefds: [2]std.posix.fd_t,
         ) !void {
             comptime desc.validate();
 
+            std.posix.close(pipefds[0]);
+
+            // TODO: perhaps needs rework after we move over the sandboxed version
             var map: Map = .{};
             defer map.deinit(allocator);
 
-            inline for (desc.edges, 0..) |edge, i| {
-                const gop = try map.getOrPut(allocator, .fromEdge(edge));
+            // inline for (desc.edges, 0..) |edge, i| {
+            //     const gop = try map.getOrPut(allocator, .fromEdge(edge));
 
-                if (gop.found_existing) {
-                    // if two edges share the same "from" and "name",
-                    // it must be a ring shared between multiple consumers
-                    std.debug.assert(edge.mode == .shared);
-                } else {
-                    const Ring = spsc.Producer(edge.type, edge.capacity);
-                    const total_size = @sizeOf(Ring);
+            //     if (gop.found_existing) {
+            //         // if two edges share the same "from" and "name",
+            //         // it must be a ring shared between multiple consumers
+            //         std.debug.assert(edge.mode == .shared);
+            //     } else {
+            //         const Ring = spsc.Producer(edge.type, edge.capacity);
+            //         const total_size = @sizeOf(Ring);
 
-                    var path_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
-                    const path = try std.fmt.bufPrintZ(&path_buffer, "/tile_ring_{d}", .{i});
-                    const fd = std.c.shm_open(path, @bitCast(std.c.O{
-                        .CREAT = true,
-                        .ACCMODE = .RDWR,
-                    }), 0o600);
-                    if (fd < 0) @panic("failed to shm_open");
-                    if (std.c.ftruncate(fd, total_size) != 0) @panic("failed to ftruncate");
-                    const mapped = try std.posix.mmap(
-                        null,
-                        total_size,
-                        std.posix.PROT.READ | std.posix.PROT.WRITE,
-                        .{ .TYPE = .SHARED },
-                        fd,
-                        0,
-                    );
+            //         var path_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
+            //         const path = try std.fmt.bufPrintZ(&path_buffer, "/tile_ring_{d}", .{i});
+            //         const fd = std.c.shm_open(path, @bitCast(std.c.O{
+            //             .CREAT = true,
+            //             .ACCMODE = .RDWR,
+            //         }), 0o600);
+            //         if (fd < 0) @panic("failed to shm_open");
+            //         if (std.c.ftruncate(fd, total_size) != 0) @panic("failed to ftruncate");
+            //         const mapped = try std.posix.mmap(
+            //             null,
+            //             total_size,
+            //             std.posix.PROT.READ | std.posix.PROT.WRITE,
+            //             .{ .TYPE = .SHARED },
+            //             fd,
+            //             0,
+            //         );
 
-                    const p: *Ring = @ptrCast(mapped.ptr);
-                    p.init();
-                    gop.value_ptr.* = &p.erased;
-                }
-            }
+            //         const p: *Ring = @ptrCast(mapped.ptr);
+            //         p.init();
+            //         gop.value_ptr.* = &p.erased;
+            //     }
+            // }
 
-            var pid_map: std.AutoHashMapUnmanaged(std.posix.pid_t, Tile) = .{};
-            defer pid_map.deinit(allocator);
+            // var pid_map: std.AutoHashMapUnmanaged(std.posix.pid_t, Tile) = .{};
+            // defer pid_map.deinit(allocator);
+
+            // TODO: store and restore the affinity of the pid process.
+            // we don't want it left stuck on the same core as an important tile.
+
+            // + 1 for the main process pipe as well
+            var fds: std.BoundedArray(std.posix.pollfd, num_tiles + 1) = .{};
+            var child_pids: std.BoundedArray(std.posix.pid_t, num_tiles) = .{};
+            var child_names: std.BoundedArray([]const u8, num_tiles) = .{};
 
             inline for (@typeInfo(@TypeOf(desc.tiles)).@"struct".fields) |tile_field| {
                 const tile = @field(desc.tiles, tile_field.name) orelse continue; // don't spawn disabled tiles
                 const id = @field(Id, tile_field.name);
 
-                const pid = try std.posix.fork();
-                if (pid < 0) @panic("fork failed?");
-                if (pid == 0) {
-                    // child
-                    // we *cannot* return errors from within the fork,
-                    // since it could lead to unexpected execution outside this function
-                    errdefer comptime unreachable;
+                const child_pipefd = try std.posix.pipe2(.{ .CLOEXEC = true });
+                try fds.append(.{ .fd = child_pipefd[0], .events = 0, .revents = 0 });
+                try child_pids.append(try runTile(
+                    tile,
+                    id,
+                    desc,
+                    funcs,
+                    &map,
+                    child_pipefd[1],
+                ));
+                try child_names.append(tile_field.name);
+                std.posix.close(child_pipefd[1]);
+            }
 
-                    runTile(tile, id, desc, funcs, tile_field.name, &map) catch |err| {
-                        std.debug.print(
-                            "'{s}' failed with error: {s}\n",
-                            .{ @tagName(id), @errorName(err) },
-                        );
-                        if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace.*);
-                        std.debug.print("'{s}': aborting", .{@tagName(id)});
-                        std.posix.abort();
-                    };
+            // TODO: some sort of sandboxing for the pid process as well
 
-                    std.debug.print("'{s}' exiting\n", .{@tagName(id)});
-                    std.posix.exit(0); // tile done
-                } else {
-                    // parent, record the pid
-                    try pid_map.put(allocator, pid, .{
-                        .id = id,
-                        .info = tile,
-                    });
+            // Wait for all of the child process PIDs to die in order for them to not show up.
+            for (child_pids.constSlice(), child_names.constSlice()) |pid, name| {
+                const result = std.posix.wait4(pid, __WALL, null);
+                if (pid != result.pid) {
+                    @panic("wait4() return an unexpected pid");
+                } else if (!W.IFEXITED(result.status)) {
+                    std.debug.panic(
+                        "tile: '{s}' exited while booting with code: {d}",
+                        .{ name, W.TERMSIG(result.status) },
+                    );
+                }
+                const exit_code = W.EXITSTATUS(result.status);
+                if (exit_code != 0) {
+                    std.debug.panic("tile: '{s}' exited with code: {d}", .{ name, exit_code });
                 }
             }
 
-            // we begin the role of watchdog now, listening for any failures with the tiles
-            const log = std.log.scoped(.watchdog);
-            while (true) { // keep running until a child dies
-                const result = std.posix.waitpid(-1, 0);
-                defer std.debug.assert(pid_map.remove(result.pid));
-                const pid = result.pid;
-                const status = result.status;
-                if (pid == -1) @panic("something went wrong");
+            // place the main pipe last
+            try fds.append(.{ .fd = pipefds[1], .events = 0, .revents = 0 });
 
-                const W = std.c.W;
-                if (W.IFEXITED(status))
-                    log.warn("Child {d} exited with status: {d}", .{ pid, W.EXITSTATUS(status) })
-                else if (W.IFSIGNALED(status))
-                    log.warn("Child {d} killed by signal {d}", .{ pid, W.TERMSIG(status) })
-                else if (W.IFSTOPPED(status))
-                    log.warn("Child {d} stopped by signal {d}", .{ pid, W.STOPSIG(status) });
+            while (true) {
+                _ = try std.posix.poll(fds.slice(), -1);
+
+                for (fds.constSlice(), 0..) |fd, i| {
+                    if (fd.revents != 0) {
+                        if (i == num_tiles) std.posix.exit(0); // parent is dead
+                        const tile_name = child_names.get(i);
+
+                        // reap the child process
+                        var wstatus: u32 = undefined;
+                        const rc = linux.wait4(-1, &wstatus, __WALL | std.posix.W.NOHANG, null);
+                        switch (std.posix.errno(rc)) {
+                            .SUCCESS => continue, // spurious wakeup
+                            else => unreachable,
+                        }
+
+                        if (W.IFEXITED(wstatus)) {
+                            const exit_code = W.EXITSTATUS(wstatus);
+                            if (exit_code == 0) {
+                                std.debug.print("tile: '{s}' exited with exit code zero\n", .{});
+                            } else {
+                                std.debug.print("tile: '{s}' exited with code: {d}\n", .{exit_code});
+                                std.posix.exit(exit_code);
+                            }
+                        } else {
+                            std.debug.print("tile: '{s}' exited with signal: {d}\n", .{ tile_name, W.TERMSIG(wstatus) });
+                            std.posix.exit(1);
+                        }
+                    }
+                }
             }
         }
 
@@ -494,55 +531,135 @@ pub fn Topology(comptime Id: type, comptime Types: type) type {
             comptime id: Id,
             comptime desc: Description,
             funcs: desc.Functions(),
-            comptime tile_name: []const u8,
             map: *const Map,
-        ) !void {
+            pipefd: std.posix.fd_t,
+        ) !std.posix.pid_t {
+            _ = funcs;
+            _ = map;
+
             // setup the info requested of this tile.
             {
-                // pin the tile to the specified core in the topology
+                // pin the tile to the specified core in the topology. we set the affinity before the clone
+                // in order to ensure the kernel only touches the tile on the right core.
                 var set: std.os.linux.cpu_set_t = @splat(0);
                 const size_in_bits = 8 * @sizeOf(usize);
                 set[tile.core / size_in_bits] |= @as(usize, 1) << @intCast(tile.core % size_in_bits);
                 try std.os.linux.sched_setaffinity(0, &set);
-
-                // configure the stack size
-                if (tile.stack_size) |stack_size| {
-                    var rl = try std.posix.getrlimit(.STACK);
-                    if (rl.cur < stack_size) {
-                        rl.cur = stack_size;
-                        try std.posix.setrlimit(.STACK, rl);
-                    }
-                }
-
-                // set the name of the process to the id, doesn't require a pid
-                switch (@as(std.posix.E, @enumFromInt(try std.posix.prctl(
-                    .SET_NAME,
-                    .{@intFromPtr(@tagName(id).ptr)},
-                )))) {
-                    .SUCCESS => {},
-                    else => |e| return std.posix.unexpectedErrno(e),
-                }
             }
 
-            // TODO: there are a few nested loops here, not sure how to optimize yet, but doesn't really matter for perf.
-            const Args = desc.Args(id);
-            var args: Args = undefined;
-            inline for (@typeInfo(Args).@"struct".fields) |field| {
-                // find the `from` which will key into the map with the arg field name to find the ring we need to use
-                const from_id = inline for (desc.edges) |edge| {
-                    if ((edge.to == id or edge.from == id) and
-                        std.mem.eql(u8, edge.name, field.name)) break edge.from;
-                } else unreachable;
+            // remove CLOEXEC from the side of the pipe we're sending to the tile
+            _ = try std.posix.fcntl(pipefd, std.posix.F.SETFD, 0);
+            const fork_pid = try std.posix.fork();
+            if (fork_pid == 0) {
+                // child
+                // now we setup the execve call to isolate the address space
 
-                @field(args, field.name) = @alignCast(@fieldParentPtr("erased", map.get(.{
-                    .id = from_id,
-                    .name = field.name,
-                }).?));
+                // TODO: redo this, uhhh, yeah....
+                var self_exe_buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
+                const self_exe_path = try std.fs.selfExePath(&self_exe_buffer);
+                self_exe_buffer[self_exe_path.len] = 0;
+                const self_exe_path_z = self_exe_buffer[0..self_exe_path.len :0];
+                const args: [*:null]const ?[*:0]const u8 = &.{ self_exe_path_z, "run-tile", @tagName(id) };
+                return std.posix.execveZ(self_exe_path_z, args, &.{});
+            } else {
+                _ = try std.posix.fcntl(pipefd, std.posix.F.SETFD, std.posix.FD_CLOEXEC);
+                return fork_pid;
             }
 
-            const func = @field(funcs, tile_name);
-            const arguments = if (@typeInfo(Args).@"struct".fields.len == 0) .{} else .{args};
-            try @call(.auto, func, arguments);
+            // // TODO: there are a few nested loops here, not sure how to optimize yet, but doesn't really matter for perf.
+            // const Args = desc.Args(id);
+            // var args: Args = undefined;
+            // inline for (@typeInfo(Args).@"struct".fields) |field| {
+            //     // find the `from` which will key into the map with the arg field name to find the ring we need to use
+            //     const from_id = inline for (desc.edges) |edge| {
+            //         if ((edge.to == id or edge.from == id) and
+            //             std.mem.eql(u8, edge.name, field.name)) break edge.from;
+            //     } else unreachable;
+
+            //     @field(args, field.name) = @alignCast(@fieldParentPtr("erased", map.get(.{
+            //         .id = from_id,
+            //         .name = field.name,
+            //     }).?));
+            // }
+
         }
     };
 }
+
+const STACK_SIZE = 8 << 20;
+const NORMAL_PAGE_SIZE = std.heap.page_size_min;
+const __WALL = 0x40000000; // Wait on all children regardless of type.
+
+/// Performs a very similar function to `std.Thread`, however it runs the functions in a NEWPID and backed by a large page stack.
+pub const PidIsolation = struct {
+    /// Creates a child of the main process in a new PID namespace. We hold an open
+    /// pipe to it in order to give the child the ability to poll whether the parent
+    /// is still alive. For the parent to check, it can just waitpid.
+    pub fn spawn(comptime func: anytype, args: anytype) !std.posix.fd_t {
+        const Args = @TypeOf(args);
+        const S = struct {
+            fn entryFunction(raw_arg: usize) callconv(.c) u8 {
+                const args_ptr: *Args = @ptrFromInt(raw_arg);
+                @call(.auto, func, args_ptr.*) catch |err| {
+                    std.debug.print("error: {s}\n", .{@errorName(err)});
+                    if (@errorReturnTrace()) |trace| {
+                        std.debug.dumpStackTrace(trace.*);
+                    }
+                    std.posix.abort(); // kills main process
+                };
+                return 0;
+            }
+        };
+
+        const map_size = STACK_SIZE + (2 * NORMAL_PAGE_SIZE);
+        const memory = try std.posix.mmap(
+            null,
+            map_size,
+            std.posix.PROT.READ | std.posix.PROT.WRITE,
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+            -1,
+            0,
+        );
+
+        // create zones above and below the mmaped stack to guard against access
+        const lo_region = memory[0..NORMAL_PAGE_SIZE];
+        const hi_region = memory[NORMAL_PAGE_SIZE + STACK_SIZE ..][0..NORMAL_PAGE_SIZE];
+
+        std.posix.munmap(lo_region);
+        std.posix.munmap(hi_region);
+
+        if ((try std.posix.mmap(
+            lo_region.ptr,
+            NORMAL_PAGE_SIZE,
+            std.posix.PROT.NONE,
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true },
+            -1,
+            0,
+        )).ptr != lo_region.ptr) @panic("failed to init lo_region");
+        if ((try std.posix.mmap(
+            hi_region.ptr,
+            NORMAL_PAGE_SIZE,
+            std.posix.PROT.NONE,
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true },
+            -1,
+            0,
+        )).ptr != hi_region.ptr) @panic("failed to init hi_region");
+
+        const stack = memory[NORMAL_PAGE_SIZE..][0..STACK_SIZE];
+        const rc = linux.clone(
+            &S.entryFunction,
+            @intFromPtr(stack.ptr + STACK_SIZE),
+            linux.CLONE.NEWPID, // new pid namespace, TODO: needs root perms to use NEWPID?
+            @intFromPtr(&args),
+            null,
+            0,
+            null,
+        );
+        switch (std.os.linux.E.init(rc)) {
+            .SUCCESS => {},
+            else => |errno| std.debug.panic("clone failed with: {s}", .{@tagName(errno)}),
+        }
+
+        return @intCast(rc);
+    }
+};

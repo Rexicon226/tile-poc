@@ -1,99 +1,72 @@
 const std = @import("std");
+const linux = std.os.linux;
+
 const topo = @import("topology.zig");
 
 const Ids = enum {
     idle,
-    producer1,
-    producer2,
-    consumer1,
 };
 
-const Types = enum {
-    foo,
-
-    pub fn Data(comptime t: Types) type {
-        return switch (t) {
-            .foo => Foo,
-        };
-    }
-
-    const Foo = struct {
-        x: u32 align(64),
-    };
-};
+const Types = enum {};
 
 const Topology = topo.Topology(Ids, Types);
 
 const topology: Topology.Description = .{
     .tiles = .{
-        // Will just kinda set there and not do anything. For experimenting.
         .idle = .{ .core = 0 },
-
-        // This tile will just be running without any connections.
-        // As an example, request 64mb of stack size (more than the default 8mb on Linux)
-        .producer1 = .{ .core = 1, .stack_size = 64 * 1024 * 1024 },
-
-        // These tiles share a ring, where producer2 pushes and consumer1 pops.
-        .producer2 = .{ .core = 2 },
-        .consumer1 = .{ .core = 3 },
     },
-    .edges = &.{
-        .{
-            .name = "foo_channel",
-            // describes the relationship in the previous sentence ^
-            .from = .producer2,
-            .to = .consumer1,
-            // consumer1 can only read from the queue, it will be given one that only has a `pop` method
-            .mode = .readonly,
-            // the type of element being passed along the ring
-            .type = .foo,
-            .capacity = 1024,
-        },
-    },
+    .edges = &.{},
 };
 
 pub fn main() !void {
-    try Topology.spawn(std.heap.smp_allocator, topology, .{
-        .idle = idle,
-        .producer1 = producer1,
-        .producer2 = producer2,
-        .consumer1 = consumer1,
-    });
+    const functions = topology.Functions(){ .idle = idle };
 
-    std.debug.print("ending!\n", .{});
+    const args = std.os.argv;
+    if (args.len > 1) {
+        const sub_command = std.mem.span(args[1]);
+        std.debug.assert(std.mem.eql(u8, sub_command, "run-tile"));
+
+        const tile_name = std.mem.span(args[2]);
+        inline for (@typeInfo(@TypeOf(functions)).@"struct".fields) |field| {
+            if (std.mem.eql(u8, field.name, tile_name)) {
+                const func = @field(functions, field.name);
+                _ = try topo.PidIsolation.spawn(
+                    func,
+                    .{},
+                );
+            }
+        }
+        return;
+    }
+
+    const pipefd = try std.posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+    const pid_namespace = try topo.PidIsolation.spawn(
+        Topology.spawn,
+        .{
+            std.heap.smp_allocator,
+            topology,
+            functions,
+            pipefd,
+        },
+    );
+    std.posix.close(pipefd[1]);
+
+    const __WALL = 0x40000000; // Wait on all children regardless of type.
+    const result = std.posix.wait4(pid_namespace, __WALL, null);
+    const W = std.c.W;
+    if (W.IFEXITED(result.status))
+        std.debug.print("PidNamespace exited with status: {d}\n", .{W.EXITSTATUS(result.status)})
+    else if (W.IFSIGNALED(result.status))
+        std.debug.print("PidNamespace killed by signal {d}\n", .{W.TERMSIG(result.status)})
+    else if (W.IFSTOPPED(result.status))
+        std.debug.print("PidNamespace stopped by signal {d}\n", .{W.STOPSIG(result.status)});
+
+    std.debug.print("main process exiting!\n", .{});
 }
 
 fn idle() !void {
-    std.Thread.sleep(3 * std.time.ns_per_s);
-}
+    std.debug.print("idle spawned\n", .{});
+    std.Thread.sleep(1 * std.time.ns_per_s);
 
-fn producer1() !void {
-    const stack_size = try std.posix.getrlimit(.STACK);
-    std.debug.print("producer 1 started up! {d}\n", .{std.fmt.fmtIntSizeBin(stack_size.cur)});
-    // does something here... but has no arguments!
-    std.Thread.sleep(5 * std.time.ns_per_s);
-}
-
-fn producer2(args: topology.Args(.producer2)) !void {
-    const stack_size = try std.posix.getrlimit(.STACK);
-    std.debug.print("producer 2 started up! {d}\n", .{std.fmt.fmtIntSizeBin(stack_size.cur)});
-
-    const ring = args.foo_channel;
-    for (0..20) |i| {
-        ring.push(.{ .x = @intCast(i) }) catch break;
-        std.debug.print("pushed: {d}\n", .{i});
-    }
-    std.debug.print("producer 2 finished pushing\n", .{});
-}
-
-fn consumer1(args: topology.Args(.consumer1)) !void {
-    const stack_size = try std.posix.getrlimit(.STACK);
-    std.debug.print("consumer 1 started up! {d}\n", .{std.fmt.fmtIntSizeBin(stack_size.cur)});
-    std.Thread.sleep(2 * std.time.ns_per_s);
-
-    const ring = args.foo_channel;
-    while (ring.pop()) |element| {
-        std.debug.print("consumer 1 got: {d}\n", .{element.x});
-    }
-    std.posix.abort(); // showcase what the watchdog does on abort
+    while (true) {}
 }
