@@ -34,8 +34,8 @@ const topology: Topology.Description = .{
         .producer1 = .{ .core = 1, .stack_size = 64 * 1024 * 1024 },
 
         // These tiles share a ring, where producer2 pushes and consumer1 pops.
-        .producer2 = .{ .core = 2 },
-        .consumer1 = .{ .core = 3 },
+        .producer2 = .{ .core = 6 },
+        .consumer1 = .{ .core = 7 },
     },
     .edges = &.{
         .{
